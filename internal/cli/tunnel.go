@@ -471,7 +471,13 @@ func checkSSMDependencies() error {
 // buildAWSEnv builds a cmd.Env slice with AWS credentials injected explicitly.
 // This is required for auto_connect tunnels started before the shell hook sources the env file.
 func buildAWSEnv(awsCfg *config.AWSConfig, awsCreds *config.AWSCredentials) []string {
-	env := os.Environ()
+	hostEnv := os.Environ()
+	env := make([]string, 0, len(hostEnv))
+	for _, e := range hostEnv {
+		if !strings.HasPrefix(e, "AWS_") {
+			env = append(env, e)
+		}
+	}
 	if awsCfg.Config != "" {
 		env = append(env, "AWS_CONFIG_FILE="+expandPath(awsCfg.Config))
 	}

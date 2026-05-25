@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -238,6 +239,53 @@ func TestBuildAWSEnv_CustomConfigFile(t *testing.T) {
 	}
 	if !hasConfigFile {
 		t.Error("AWS_CONFIG_FILE not set when aws.config is configured")
+	}
+}
+
+func TestBuildAWSEnv_HostVarsAreFiltered(t *testing.T) {
+	t.Setenv("AWS_REGION", "us-east-1")
+	t.Setenv("AWS_DEFAULT_REGION", "us-east-1")
+	t.Setenv("AWS_PROFILE", "host-profile")
+	t.Setenv("AWS_ACCESS_KEY_ID", "HOST_KEY_ID")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "HOST_SECRET")
+
+	awsCfg := &config.AWSConfig{Region: "eu-west-1"}
+	creds := &config.AWSCredentials{
+		AccessKeyID:     "CTX_KEY_ID",
+		SecretAccessKey: "CTX_SECRET",
+	}
+
+	env := buildAWSEnv(awsCfg, creds)
+
+	counts := map[string]int{}
+	values := map[string]string{}
+	for _, e := range env {
+		for _, key := range []string{"AWS_REGION", "AWS_DEFAULT_REGION", "AWS_PROFILE", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"} {
+			if strings.HasPrefix(e, key+"=") {
+				counts[key]++
+				if counts[key] == 1 {
+					values[key] = e[len(key)+1:]
+				}
+			}
+		}
+	}
+
+	for _, key := range []string{"AWS_REGION", "AWS_DEFAULT_REGION", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"} {
+		if counts[key] != 1 {
+			t.Errorf("%s: expected exactly 1 occurrence, got %d", key, counts[key])
+		}
+	}
+	if values["AWS_REGION"] != "eu-west-1" {
+		t.Errorf("AWS_REGION: got %q, want %q", values["AWS_REGION"], "eu-west-1")
+	}
+	if values["AWS_ACCESS_KEY_ID"] != "CTX_KEY_ID" {
+		t.Errorf("AWS_ACCESS_KEY_ID: got %q, want %q", values["AWS_ACCESS_KEY_ID"], "CTX_KEY_ID")
+	}
+	if values["AWS_SECRET_ACCESS_KEY"] != "CTX_SECRET" {
+		t.Errorf("AWS_SECRET_ACCESS_KEY: got %q, want %q", values["AWS_SECRET_ACCESS_KEY"], "CTX_SECRET")
+	}
+	if counts["AWS_PROFILE"] != 0 {
+		t.Errorf("AWS_PROFILE should not appear when vault creds are used, got %d occurrences", counts["AWS_PROFILE"])
 	}
 }
 

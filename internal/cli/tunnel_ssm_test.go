@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2026 Enrique Alonso <enrialonso@gmail.com>
+// SPDX-FileCopyrightText: 2026 Vedran Lebo <vedran@flyingpenguin.tech>
 // SPDX-License-Identifier: MIT
 
 package cli
@@ -66,13 +66,13 @@ func TestBuildSSMArgs(t *testing.T) {
 	tunnel := config.TunnelConfig{
 		Name:       "postgres",
 		Type:       "aws",
-		Target:     "i-0abc123def456789a",
+		Target:     config.TunnelTarget{Kind: config.TunnelTargetKindLiteral, Literal: "i-0abc123def456789a"},
 		RemoteHost: "db.internal.vpc",
 		RemotePort: 5432,
 		LocalPort:  5432,
 	}
 
-	args := buildSSMArgs(tunnel)
+	args := buildSSMArgs("i-0abc123def456789a", tunnel)
 
 	expected := []string{
 		"ssm", "start-session",
@@ -94,13 +94,13 @@ func TestBuildSSMArgs(t *testing.T) {
 func TestBuildSSMArgs_PortSubstitution(t *testing.T) {
 	tunnel := config.TunnelConfig{
 		Type:       "aws",
-		Target:     "i-0abc123def456789a",
+		Target:     config.TunnelTarget{Kind: config.TunnelTargetKindLiteral, Literal: "i-0abc123def456789a"},
 		RemoteHost: "cache.internal",
 		RemotePort: 6379,
 		LocalPort:  16379, // remapped port
 	}
 
-	args := buildSSMArgs(tunnel)
+	args := buildSSMArgs("i-0abc123def456789a", tunnel)
 
 	// Find --parameters arg
 	var params string
@@ -289,6 +289,183 @@ func TestBuildAWSEnv_HostVarsAreFiltered(t *testing.T) {
 	}
 }
 
+// --- resolveAWSTarget tests ---
+
+// fakeAWSBin writes a shell script at <tmpDir>/aws that prints the given JSON output and exits 0.
+func fakeAWSBin(t *testing.T, tmpDir, responseJSON string) []string {
+	t.Helper()
+	script := fmt.Sprintf("#!/bin/sh\necho '%s'\n", responseJSON)
+	if err := os.WriteFile(filepath.Join(tmpDir, "aws"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return append(os.Environ(), "PATH="+tmpDir)
+}
+
+// fakeAWSBinFail writes a shell script at <tmpDir>/aws that exits non-zero.
+func fakeAWSBinFail(t *testing.T, tmpDir string) []string {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(tmpDir, "aws"), []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return append(os.Environ(), "PATH="+tmpDir)
+}
+
+func TestResolveAWSTarget_Literal(t *testing.T) {
+	target := config.TunnelTarget{Kind: config.TunnelTargetKindLiteral, Literal: "i-0abc123def456789a"}
+	got, err := resolveAWSTarget(target, os.Environ())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != "i-0abc123def456789a" {
+		t.Errorf("got %q, want %q", got, "i-0abc123def456789a")
+	}
+}
+
+func TestResolveAWSTarget_Export_Found(t *testing.T) {
+	tmpDir := t.TempDir()
+	response := map[string]any{
+		"Exports": []map[string]string{
+			{"Name": "MyStack-BastionInstanceId", "Value": "i-0abc123def456789a"},
+		},
+	}
+	out, _ := json.Marshal(response)
+	awsEnv := fakeAWSBin(t, tmpDir, string(out))
+	t.Setenv("PATH", tmpDir)
+
+	target := config.TunnelTarget{Kind: config.TunnelTargetKindExport, Export: "MyStack-BastionInstanceId"}
+	got, err := resolveAWSTarget(target, awsEnv)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != "i-0abc123def456789a" {
+		t.Errorf("got %q, want %q", got, "i-0abc123def456789a")
+	}
+}
+
+func TestResolveAWSTarget_Export_Paginated(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// First page returns no match but includes NextToken; second page (--next-token arg) has the export.
+	// Uses only shell builtins (case/$*) so the script works even when PATH=tmpDir only.
+	script := `#!/bin/sh
+case "$*" in
+  *--next-token*)
+    echo '{"Exports":[{"Name":"MyStack-BastionInstanceId","Value":"i-0abc123def456789a"}]}'
+    ;;
+  *)
+    echo '{"Exports":[{"Name":"OtherExport","Value":"i-other"}],"NextToken":"page2"}'
+    ;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(tmpDir, "aws"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", tmpDir)
+	awsEnv := os.Environ()
+
+	target := config.TunnelTarget{Kind: config.TunnelTargetKindExport, Export: "MyStack-BastionInstanceId"}
+	got, err := resolveAWSTarget(target, awsEnv)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != "i-0abc123def456789a" {
+		t.Errorf("got %q, want %q", got, "i-0abc123def456789a")
+	}
+}
+
+func TestResolveAWSTarget_Export_NotFound(t *testing.T) {
+	tmpDir := t.TempDir()
+	response := map[string]any{"Exports": []any{}}
+	out, _ := json.Marshal(response)
+	awsEnv := fakeAWSBin(t, tmpDir, string(out))
+	t.Setenv("PATH", tmpDir)
+
+	target := config.TunnelTarget{Kind: config.TunnelTargetKindExport, Export: "NonExistent-Export"}
+	_, err := resolveAWSTarget(target, awsEnv)
+	if err == nil {
+		t.Fatal("expected error for missing export, got nil")
+	}
+}
+
+func TestResolveAWSTarget_Export_AWSFails(t *testing.T) {
+	tmpDir := t.TempDir()
+	awsEnv := fakeAWSBinFail(t, tmpDir)
+	t.Setenv("PATH", tmpDir)
+
+	target := config.TunnelTarget{Kind: config.TunnelTargetKindExport, Export: "MyStack-BastionInstanceId"}
+	_, err := resolveAWSTarget(target, awsEnv)
+	if err == nil {
+		t.Fatal("expected error when aws CLI fails, got nil")
+	}
+}
+
+func TestResolveAWSTarget_StackOutput_Found(t *testing.T) {
+	tmpDir := t.TempDir()
+	response := map[string]any{
+		"Stacks": []map[string]any{
+			{
+				"Outputs": []map[string]string{
+					{"OutputKey": "BastionInstanceId", "OutputValue": "i-0abc123def456789a"},
+				},
+			},
+		},
+	}
+	out, _ := json.Marshal(response)
+	awsEnv := fakeAWSBin(t, tmpDir, string(out))
+	t.Setenv("PATH", tmpDir)
+
+	target := config.TunnelTarget{Kind: config.TunnelTargetKindStackOutput, Stack: "my-infra", Output: "BastionInstanceId"}
+	got, err := resolveAWSTarget(target, awsEnv)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != "i-0abc123def456789a" {
+		t.Errorf("got %q, want %q", got, "i-0abc123def456789a")
+	}
+}
+
+func TestResolveAWSTarget_StackOutput_StackNotFound(t *testing.T) {
+	tmpDir := t.TempDir()
+	awsEnv := fakeAWSBinFail(t, tmpDir)
+	t.Setenv("PATH", tmpDir)
+
+	target := config.TunnelTarget{Kind: config.TunnelTargetKindStackOutput, Stack: "nonexistent-stack", Output: "BastionInstanceId"}
+	_, err := resolveAWSTarget(target, awsEnv)
+	if err == nil {
+		t.Fatal("expected error when stack not found, got nil")
+	}
+}
+
+func TestResolveAWSTarget_StackOutput_OutputKeyNotFound(t *testing.T) {
+	tmpDir := t.TempDir()
+	response := map[string]any{
+		"Stacks": []map[string]any{
+			{
+				"Outputs": []map[string]string{
+					{"OutputKey": "OtherKey", "OutputValue": "i-0abc123def456789a"},
+				},
+			},
+		},
+	}
+	out, _ := json.Marshal(response)
+	awsEnv := fakeAWSBin(t, tmpDir, string(out))
+	t.Setenv("PATH", tmpDir)
+
+	target := config.TunnelTarget{Kind: config.TunnelTargetKindStackOutput, Stack: "my-infra", Output: "BastionInstanceId"}
+	_, err := resolveAWSTarget(target, awsEnv)
+	if err == nil {
+		t.Fatal("expected error for missing output key, got nil")
+	}
+}
+
+func TestResolveAWSTarget_InvalidKind(t *testing.T) {
+	target := config.TunnelTarget{Kind: config.TunnelTargetKindInvalid}
+	_, err := resolveAWSTarget(target, os.Environ())
+	if err == nil {
+		t.Fatal("expected error for invalid target kind, got nil")
+	}
+}
+
 // writeTunnelStateFile writes a tunnelState JSON file under stateDir/tunnels/<context>.json.
 func writeTunnelStateFile(t *testing.T, stateDir, contextName string, state *tunnelState) string {
 	t.Helper()
@@ -330,7 +507,7 @@ func TestStopContextTunnels_StopsAWSTunnels(t *testing.T) {
 				Config: config.TunnelConfig{
 					Name:       "postgres",
 					Type:       "aws",
-					Target:     "i-0abc123def456789a",
+					Target:     config.TunnelTarget{Kind: config.TunnelTargetKindLiteral, Literal: "i-0abc123def456789a"},
 					RemoteHost: "db.internal.vpc",
 					RemotePort: 5432,
 					LocalPort:  5432,
